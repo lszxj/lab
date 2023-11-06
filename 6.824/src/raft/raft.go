@@ -128,9 +128,7 @@ type SnapshotArgs struct {
 	LeaderId         int
 	LastIncludeIndex int
 	LastIncludeTerm  int
-	Offset           int
 	data             []int
-	done             bool // true if this is the last chunk
 }
 
 type SnapshotReply struct {
