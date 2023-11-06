@@ -215,7 +215,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.mu.Unlock()
 		return
 	}
-	rf.logEntries = rf.logEntries[index+1-rf.lastIncludedIndex:]
+	temp := rf.lastIncludedIndex
+	rf.commitIndex = max(index, rf.commitIndex)
+	rf.lastApplied = max(index, rf.lastApplied)
+	rf.lastIncludedTerm = rf.logEntries[index-temp].Term
+	rf.logEntries = rf.logEntries[index+1-temp:]
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
 	if e.Encode(rf.currentTerm) != nil ||
@@ -230,6 +234,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Unlock()
 }
 
+func (rf *Raft) GetSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+	if reply.Term > args.Term || args.LastIncludeIndex <= rf.lastIncludedIndex {
+		rf.mu.Unlock()
+		return
+	}
+	temp := rf.lastIncludedIndex
+	Len := temp + len(rf.logEntries)
+	if Len > args.LastIncludeIndex {
+
+	}
+	rf.mu.Unlock()
+}
+
 func (rf *Raft) RandTime(min, max time.Duration) time.Duration {
 	delta := max - min
 	ret := min + time.Duration(rand.Int63n(int64(delta)))
@@ -239,6 +258,14 @@ func (rf *Raft) RandTime(min, max time.Duration) time.Duration {
 
 func min(a, b int) int {
 	if a < b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	} else {
 		return b
