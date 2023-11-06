@@ -198,12 +198,12 @@ type Raft struct {
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 //
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
+//func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+//
+//	// Your code here (2D).
+//
+//	return true
+//}
 
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
@@ -213,7 +213,22 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
-
+	if index <= rf.lastIncludedIndex {
+		rf.mu.Unlock()
+		return
+	}
+	rf.logEntries = rf.logEntries[index+1-rf.lastIncludedIndex:]
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	if e.Encode(rf.currentTerm) != nil ||
+		e.Encode(rf.votedFor) != nil ||
+		e.Encode(rf.logEntries) != nil ||
+		e.Encode(rf.lastIncludedIndex) != nil ||
+		e.Encode(rf.lastIncludedTerm) != nil {
+		log.Fatalf("fail to encode!\n")
+	}
+	data := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 	rf.mu.Unlock()
 }
 
