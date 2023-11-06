@@ -256,7 +256,6 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
 	if e.Encode(rf.currentTerm) != nil ||
-		e.Encode(rf.lastApplied) != nil ||
 		e.Encode(rf.votedFor) != nil ||
 		e.Encode(rf.logEntries) != nil ||
 		e.Encode(rf.lastIncludedIndex) != nil ||
@@ -277,18 +276,26 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
 	var (
-		DecodeTerm    int
-		DecodeIndex   int
-		DecodeVote    int
-		DecodeEntries []entry
+		DecodeTerm      int
+		DecodeVote      int
+		DecodeEntries   []entry
+		DecodeLastIndex int
+		DecodeLastTerm  int
 	)
-	if d.Decode(&DecodeTerm) != nil || d.Decode(&DecodeIndex) != nil || d.Decode(&DecodeVote) != nil || d.Decode(&DecodeEntries) != nil {
+	if d.Decode(&DecodeTerm) != nil ||
+		d.Decode(&DecodeVote) != nil ||
+		d.Decode(&DecodeEntries) != nil ||
+		d.Decode(&DecodeLastIndex) != nil ||
+		d.Decode(&DecodeLastTerm) != nil {
 		log.Fatalf("fail to decode!")
 	} else {
 		rf.currentTerm = DecodeTerm
-		rf.lastApplied = DecodeIndex
 		rf.votedFor = DecodeVote
 		rf.logEntries = DecodeEntries
+		rf.lastIncludedIndex = DecodeLastIndex
+		rf.lastIncludedTerm = DecodeLastTerm
+		rf.lastApplied = rf.lastIncludedIndex
+		rf.commitIndex = rf.lastIncludedIndex
 	}
 }
 
