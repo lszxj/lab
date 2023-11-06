@@ -105,10 +105,6 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 }
 
-//
-// use to heartbeat
-//
-
 type AppendArgs struct {
 	PeerIndex    int
 	LeaderTerm   int
@@ -125,6 +121,20 @@ type AppendReply struct {
 	ConflictTerm  int
 	Accept        bool
 	Back          int
+}
+
+type SnapshotArgs struct {
+	Term             int
+	LeaderId         int
+	LastIncludeIndex int
+	LastIncludeTerm  int
+	Offset           int
+	data             []int
+	done             bool // true if this is the last chunk
+}
+
+type SnapshotReply struct {
+	Term int
 }
 
 //
@@ -164,8 +174,10 @@ type Raft struct {
 	// 非易失性
 	currentTerm int // 当前服务器可见任期
 	//candidateId int     // 当前任期的candidateId
-	votedFor   int     // 当前任期投票给的candidateId，如果没有为-1
-	logEntries []entry // first index is 1
+	votedFor          int     // 当前任期投票给的candidateId，如果没有为-1
+	logEntries        []entry // first index is 1
+	lastIncludedTerm  int
+	lastIncludedIndex int
 	// 易失性
 	applyCh     chan ApplyMsg
 	state       int32 // state of Raft, is it persistent???
@@ -186,7 +198,6 @@ type Raft struct {
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 //
-
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
@@ -201,7 +212,9 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
 
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) RandTime(min, max time.Duration) time.Duration {
@@ -240,17 +253,14 @@ func (rf *Raft) GetState() (int, bool) {
 //
 
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
-	if e.Encode(rf.currentTerm) != nil || e.Encode(rf.lastApplied) != nil || e.Encode(rf.votedFor) != nil || e.Encode(rf.logEntries) != nil {
+	if e.Encode(rf.currentTerm) != nil ||
+		e.Encode(rf.lastApplied) != nil ||
+		e.Encode(rf.votedFor) != nil ||
+		e.Encode(rf.logEntries) != nil ||
+		e.Encode(rf.lastIncludedIndex) != nil ||
+		e.Encode(rf.lastIncludedTerm) != nil {
 		log.Fatalf("fail to encode!\n")
 	}
 	data := w.Bytes()
@@ -264,19 +274,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
 	var (
@@ -895,6 +892,8 @@ func (rf *Raft) init() {
 	rf.voteChan = make(chan struct{}, 10)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	//log.Printf("%d is restarted!\n", rf.me)
 }
 
