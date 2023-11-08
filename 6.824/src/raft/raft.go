@@ -128,7 +128,7 @@ type SnapshotArgs struct {
 	LeaderId         int
 	LastIncludeIndex int
 	LastIncludeTerm  int
-	data             []byte
+	Data             []byte
 }
 
 type SnapshotReply struct {
@@ -192,15 +192,65 @@ type Raft struct {
 
 }
 
+func (rf *Raft) setter(index int, Entry entry) bool {
+	if index-rf.lastIncludedIndex < 0 {
+		panic("index < 0 !!!\n")
+		return false
+	} else {
+		rf.logEntries[index-rf.lastIncludedIndex] = Entry
+		return true
+	}
+}
+
+// lock before use
+func (rf *Raft) getter(index int) entry {
+	ret := entry{}
+	if index-rf.lastIncludedIndex < 0 {
+		panic("index < 0 !!!\n")
+	} else {
+		ret = rf.logEntries[index-rf.lastIncludedIndex]
+	}
+	return ret
+}
+
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 //
+
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
 
 	return true
+}
+
+func (rf *Raft) SendSnapShot(server int) {
+	argsSnap := SnapshotArgs{}
+	argsReply := SnapshotReply{}
+	argsSnap.Term = rf.currentTerm
+	argsSnap.Data = rf.persister.ReadSnapshot()
+	if len(argsSnap.Data) == 0 { // 暂时没有快照
+		return
+	}
+	argsSnap.LastIncludeTerm = rf.lastIncludedTerm
+	argsSnap.LastIncludeIndex = rf.lastIncludedIndex
+	argsSnap.LeaderId = rf.me
+	okSnap := rf.peers[server].Call("Raft.GetSnapshot", &argsSnap, &argsReply)
+	log.Printf("args.term = %d rf.term = %d\n", argsReply.Term, rf.currentTerm)
+	if okSnap {
+		if argsReply.Term > rf.currentTerm {
+			rf.currentTerm = argsReply.Term
+			rf.votedFor = -1
+			rf.persist()
+			atomic.StoreInt32(&rf.state, Follower)
+			go rf.followerSelect()
+			return
+		} else {
+			rf.nextIndex[server] = argsSnap.LastIncludeIndex + 1
+			log.Printf("rf.next = %d\n", rf.nextIndex[server])
+		}
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -247,7 +297,7 @@ func (rf *Raft) GetSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
 	if lastIndex > args.LastIncludeIndex {
 		rf.logEntries = rf.logEntries[args.LastIncludeIndex-temp:]
 	} else {
-		rf.logEntries = rf.logEntries[lastIndex-temp:]
+		rf.logEntries = []entry{{args.LastIncludeTerm, 0}}
 	}
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludeIndex)
 	rf.lastApplied = max(rf.lastApplied, args.LastIncludeIndex)
@@ -268,11 +318,11 @@ func (rf *Raft) GetSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
 		log.Fatalf("fail to encode!\n")
 	}
 	data := w.Bytes()
-	rf.persister.SaveStateAndSnapshot(data, args.data)
+	rf.persister.SaveStateAndSnapshot(data, args.Data)
 	rf.mu.Unlock()
 	rf.applyCh <- ApplyMsg{
 		SnapshotValid: true,
-		Snapshot:      args.data,
+		Snapshot:      args.Data,
 		SnapshotIndex: args.LastIncludeIndex,
 		SnapshotTerm:  args.LastIncludeTerm,
 	}
@@ -390,7 +440,7 @@ func (rf *Raft) ResponseVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 			lastIndex := len(rf.logEntries) - 1 + rf.lastIncludedIndex
-			lastTerm := rf.logEntries[lastIndex].Term
+			lastTerm := rf.getter(lastIndex).Term
 			if args.LastLogTerm < lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex < lastIndex) {
 				return
 			} else { // voted for
@@ -413,9 +463,8 @@ func (rf *Raft) RequestVote(server int, ctx context.Context, replyCh chan<- Requ
 		rf.mu.Lock()
 		args.CandidateId = rf.me
 		args.Term = rf.currentTerm
-		fakeLast := len(rf.logEntries) - 1
-		args.LastLogIndex = rf.lastIncludedIndex + fakeLast
-		args.LastLogTerm = rf.logEntries[fakeLast].Term
+		args.LastLogIndex = rf.lastIncludedIndex + len(rf.logEntries) - 1
+		args.LastLogTerm = rf.getter(args.LastLogIndex).Term
 		rf.mu.Unlock()
 		ok := rf.peers[server].Call("Raft.ResponseVote", &args, &reply)
 		if ok {
@@ -599,8 +648,8 @@ func (rf *Raft) ReceiveEntries(args *AppendArgs, reply *AppendReply) {
 		log.Printf("raft %d is Shorter than raft %d!\n", rf.me, args.PeerIndex)
 		return
 	}
-	if rf.logEntries[args.PrevLogIndex-rf.lastIncludedIndex].Term != args.PrevLogTerm {
-		reply.ConflictTerm = rf.logEntries[args.PrevLogIndex-rf.lastIncludedIndex].Term
+	if rf.getter(args.PrevLogIndex).Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.getter(args.PrevLogIndex).Term
 		index := args.PrevLogIndex - rf.lastIncludedIndex
 		l := 1
 		r := index
@@ -630,21 +679,11 @@ func (rf *Raft) ReceiveEntries(args *AppendArgs, reply *AppendReply) {
 		// If an existing entry conflicts with a new one (same index
 		// but different terms), delete the existing entry and all that
 		// follow it (§5.3)
-		//if len(args.Entries) > 0 && len(rf.logEntries) > args.PrevLogIndex+1 && rf.logEntries[args.PrevLogIndex+1].Term != args.Entries[0].Term {
-		//	log.Printf("raft %d overrided by raft %d!\n", rf.me, args.PeerIndex)
-		//	rf.logEntries = rf.logEntries[0 : args.PrevLogIndex+1]
-		//}
 		// Append any new entries not already in the log
-		//if len(rf.logEntries)-args.PrevLogIndex-1 < len(args.Entries) {
-		//	//log.Printf("args.Entries start from index %d = %v\n", args.PrevLogIndex+1, args.Entries)
-		//	//log.Printf("raft %d get Append from raft %d!\n", rf.me, args.PeerIndex)
-		//	notin := args.Entries[len(rf.logEntries)-args.PrevLogIndex-1 : len(args.Entries)]
-		//	rf.logEntries = append(rf.logEntries, notin...)
-		//}
 		i := args.PrevLogIndex + 1
 		for i < min(len(rf.logEntries), args.PrevLogIndex+len(args.Entries)+1) {
-			if args.Entries[i-args.PrevLogIndex-1] != rf.logEntries[i-rf.lastIncludedIndex] {
-				rf.logEntries = rf.logEntries[0 : i-rf.lastIncludedIndex]
+			if args.Entries[i-args.PrevLogIndex-1] != rf.getter(i) {
+				//rf.logEntries = rf.logEntries[0 : i-rf.lastIncludedIndex]
 				break
 			}
 			i++
@@ -667,139 +706,80 @@ func (rf *Raft) ReceiveEntries(args *AppendArgs, reply *AppendReply) {
 }
 
 func (rf *Raft) AppendEntries(server int, BeatState int) {
-	args := AppendArgs{}
-	reply := AppendReply{}
-	args.BeatState = BeatState
-	{
-		rf.mu.Lock()
-		args.PeerIndex = rf.me
-		args.LeaderTerm = rf.currentTerm
-		args.LeaderCommit = rf.commitIndex
-		args.PrevLogIndex = rf.nextIndex[server] - 1
-		args.PrevLogTerm = rf.logEntries[args.PrevLogIndex-rf.lastIncludedIndex].Term
-		// log.Printf("*** preindex = %d lastindex = %d ***\n", args.PrevLogIndex, rf.lastIncludedIndex)
-		if BeatState == Append {
-			args.Entries = make([]entry, len(rf.logEntries)-args.PrevLogIndex-1+rf.lastIncludedIndex)
-			copy(args.Entries, rf.logEntries[args.PrevLogIndex+1-rf.lastIncludedIndex:])
-		}
-		rf.mu.Unlock()
+	// 发送快照
+	rf.mu.Lock()
+	if rf.nextIndex[server] <= rf.lastIncludedIndex {
+		rf.SendSnapShot(server)
 	}
-	switch BeatState {
-	case Beat:
-		if atomic.LoadInt32(&rf.state) == Leader && rf.killed() == false {
-			ok := rf.peers[server].Call("Raft.ReceiveEntries", &args, &reply)
-			if ok {
-				rf.mu.Lock()
-				if !reply.Accept {
-					if reply.Back == LowerTerm {
-						if atomic.CompareAndSwapInt32(&rf.state, Leader, Follower) {
-							log.Printf("beat: raft %d has term %d is lower than raft %d has term %d", rf.me, rf.currentTerm, server, reply.Term)
-							rf.currentTerm = reply.Term
-							rf.votedFor = -1
-							rf.persist()
-							rf.mu.Unlock()
-							go rf.followerSelect()
-							return
-						}
-					} else if reply.Back == ShortLog {
-						rf.nextIndex[server] = reply.ConflictIndex
-						rf.matchIndex[server] = rf.nextIndex[server] - 1
-					} else if reply.Back == MismatchTerm {
-						findIndex := -1
-						conflictTerm := reply.ConflictTerm
-						// 找到日志条目中term等于conflictTerm的最后一个条目的下标，没有则返回-1
-						// 利用term的单调性，可以二分
-						l := 1
-						r := len(rf.logEntries) - 1
-						for l <= r {
-							mid := (l + r) / 2
-							if conflictTerm < rf.logEntries[mid].Term {
-								l = mid + 1
-							} else if conflictTerm == rf.logEntries[mid].Term {
-								findIndex = mid
-								l = mid + 1
-							} else {
-								r = mid - 1
-							}
-						}
-						if findIndex != -1 {
-							rf.nextIndex[server] = findIndex + rf.lastIncludedIndex + 1
-						} else {
-							rf.nextIndex[server] = reply.ConflictIndex
-						}
-						rf.matchIndex[server] = rf.nextIndex[server] - 1
-					}
-					if atomic.LoadInt32(&rf.state) == Leader {
-						go rf.AppendEntries(server, Append)
-					}
-				}
-				rf.mu.Unlock()
-			} else {
-				//log.Printf("beat: raft %d find raft %d is disconnect!\n", rf.me, server)
-				//time.Sleep(HeartBeatTime / 2)
-				//if atomic.LoadInt32(&rf.state) == Leader {
-				//	go rf.AppendEntries(server, Beat)
-				//}
+	rf.mu.Unlock()
+	if atomic.LoadInt32(&rf.state) == Leader && rf.killed() == false {
+		args := AppendArgs{}
+		reply := AppendReply{}
+		args.BeatState = BeatState
+		{
+			rf.mu.Lock()
+			args.PeerIndex = rf.me
+			args.LeaderTerm = rf.currentTerm
+			args.LeaderCommit = rf.commitIndex
+			args.PrevLogIndex = rf.nextIndex[server] - 1
+			args.PrevLogTerm = rf.getter(args.PrevLogIndex).Term
+			if BeatState == Append {
+				args.Entries = make([]entry, len(rf.logEntries)-args.PrevLogIndex-1+rf.lastIncludedIndex)
+				copy(args.Entries, rf.logEntries[args.PrevLogIndex+1-rf.lastIncludedIndex:])
 			}
+			rf.mu.Unlock()
 		}
-	case Append:
-		if atomic.LoadInt32(&rf.state) == Leader && rf.killed() == false {
-			ok := rf.peers[server].Call("Raft.ReceiveEntries", &args, &reply)
-			if ok {
-				rf.mu.Lock()
-				if !reply.Accept {
-					if reply.Back == LowerTerm {
-						if atomic.CompareAndSwapInt32(&rf.state, Leader, Follower) {
-							log.Printf("append: raft %d has term %d is lower than raft %d has term %d", rf.me, rf.currentTerm, server, reply.Term)
-							rf.currentTerm = reply.Term
-							rf.votedFor = -1
-							rf.persist()
-							rf.mu.Unlock()
-							go rf.followerSelect()
-							return
-						}
-					} else if reply.Back == ShortLog {
-						rf.nextIndex[server] = reply.ConflictIndex
-						rf.matchIndex[server] = rf.nextIndex[server] - 1
-					} else if reply.Back == MismatchTerm {
-						findIndex := -1
-						conflictTerm := reply.ConflictTerm
-						// 找到日志条目中term等于conflictTerm的最后一个条目的下标，没有则返回-1
-						// 利用term的单调性，可以二分
-						l := 1
-						r := len(rf.logEntries) - 1
-						for l <= r {
-							mid := (l + r) / 2
-							if conflictTerm < rf.logEntries[mid].Term {
-								l = mid + 1
-							} else if conflictTerm == rf.logEntries[mid].Term {
-								findIndex = mid
-								l = mid + 1
-							} else {
-								r = mid - 1
-							}
-						}
-						if findIndex != -1 {
-							rf.nextIndex[server] = findIndex + 1 + rf.lastIncludedIndex
-						} else {
-							rf.nextIndex[server] = reply.ConflictIndex
-						}
-						rf.matchIndex[server] = rf.nextIndex[server] - 1
+		ok := rf.peers[server].Call("Raft.ReceiveEntries", &args, &reply)
+		if ok {
+			rf.mu.Lock()
+			if !reply.Accept {
+				if reply.Back == LowerTerm {
+					if atomic.CompareAndSwapInt32(&rf.state, Leader, Follower) {
+						log.Printf("append: raft %d has term %d is lower than raft %d has term %d", rf.me, rf.currentTerm, server, reply.Term)
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						rf.persist()
+						rf.mu.Unlock()
+						go rf.followerSelect()
+						return
 					}
-					if atomic.LoadInt32(&rf.state) == Leader {
-						go rf.AppendEntries(server, Append)
-					}
-				} else {
-					//log.Printf("server = %d\n", server)
-					rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+				} else if reply.Back == ShortLog {
+					rf.nextIndex[server] = reply.ConflictIndex
 					rf.matchIndex[server] = rf.nextIndex[server] - 1
-					rf.mu.Unlock()
-					break
+				} else if reply.Back == MismatchTerm {
+					findIndex := -1
+					conflictTerm := reply.ConflictTerm
+					// 找到日志条目中term等于conflictTerm的最后一个条目的下标，没有则返回-1
+					// 利用term的单调性，可以二分
+					l := 1
+					r := len(rf.logEntries) - 1
+					for l <= r {
+						mid := (l + r) / 2
+						if conflictTerm < rf.logEntries[mid].Term {
+							l = mid + 1
+						} else if conflictTerm == rf.logEntries[mid].Term {
+							findIndex = mid
+							l = mid + 1
+						} else {
+							r = mid - 1
+						}
+					}
+					if findIndex != -1 {
+						rf.nextIndex[server] = findIndex + 1 + rf.lastIncludedIndex
+					} else {
+						rf.nextIndex[server] = reply.ConflictIndex
+					}
+					rf.matchIndex[server] = rf.nextIndex[server] - 1
 				}
-				rf.mu.Unlock()
+				if atomic.LoadInt32(&rf.state) == Leader && BeatState == Append {
+					go rf.AppendEntries(server, Append)
+				}
 			} else {
-
+				//log.Printf("server = %d\n", server)
+				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
 			}
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -817,7 +797,7 @@ func (rf *Raft) commitInc() {
 			sort.Ints(temp)
 			if temp[length/2] < len(rf.logEntries)+rf.lastIncludedIndex &&
 				temp[length/2] > rf.commitIndex &&
-				rf.logEntries[temp[length/2]-rf.lastIncludedIndex].Term == rf.currentTerm {
+				rf.getter(temp[length/2]).Term == rf.currentTerm {
 				rf.commitIndex = temp[length/2]
 			}
 			rf.mu.Unlock()
@@ -832,6 +812,7 @@ func (rf *Raft) beatAll() {
 		if i != rf.me {
 			rf.mu.Lock()
 			if len(rf.logEntries)+rf.lastIncludedIndex > rf.nextIndex[i] {
+				rf.nextIndex[i] = len(rf.logEntries) + rf.lastIncludedIndex
 				go rf.AppendEntries(i, Append)
 			} else {
 				rf.nextIndex[i] = len(rf.logEntries) + rf.lastIncludedIndex
@@ -888,7 +869,7 @@ func (rf *Raft) applyMonitor() {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		for rf.commitIndex > rf.lastApplied && rf.lastApplied+1 < len(rf.logEntries)+rf.lastIncludedIndex {
-			Entry := rf.logEntries[rf.lastApplied+1-rf.lastIncludedIndex]
+			Entry := rf.getter(rf.lastApplied + 1)
 			log.Printf("term is %d raft %d apply %v index %d!\n", rf.currentTerm, rf.me, Entry, rf.lastApplied+1)
 			apply := ApplyMsg{
 				CommandValid: true,
